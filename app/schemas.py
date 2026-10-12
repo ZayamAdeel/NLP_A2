@@ -20,6 +20,9 @@ class HealthResponse(BaseModel):
     status: str
     ollama_reachable: bool
     model: str
+    retrieval_ready: bool = False
+    index_chunks: int = 0
+    embed_model: str = ""
 
 
 # ---- WebSocket message contracts -------------------------------------------
@@ -41,12 +44,30 @@ class ServerTokenEvent(BaseModel):
     text: str
 
 
+class SourceRef(BaseModel):
+    n: int
+    title: str
+    doc_id: str
+    category: str
+    score: float
+    snippet: str
+
+
+class RetrievalInfo(BaseModel):
+    status: str  # ok | no_match | skipped | unavailable | disabled
+    ms: float
+    cached: bool
+
+
 class ServerDoneEvent(BaseModel):
+    """Assignment-1 fields are unchanged; `sources` and `retrieval` are additive."""
     type: Literal["done"] = "done"
     time_to_first_token: Optional[float]
     total_time: Optional[float]
     tokens_per_second: Optional[float]
     stage: str
+    sources: list[SourceRef] = []
+    retrieval: Optional[RetrievalInfo] = None
 
 
 class ServerBlockedEvent(BaseModel):

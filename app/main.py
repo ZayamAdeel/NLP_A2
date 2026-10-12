@@ -11,18 +11,23 @@ Endpoints:
 The WebSocket protocol is a small JSON envelope in both directions; see
 app/schemas.py for the exact shapes and README.md for examples.
 """
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
-from app.config import OLLAMA_MODEL
+from app.config import EMBED_MODEL, OLLAMA_MODEL
 from app.conversation_manager import ConversationManager
 from app.domain import GREETING_MESSAGE
 from app.llm_engine import LLMEngineError, OllamaEngine
+from app.rag.embedder import OllamaEmbedder
+from app.rag.retriever import Retriever
 from app.schemas import (
     ClientChatMessage,
     HealthResponse,
@@ -33,7 +38,26 @@ from app.schemas import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ecommerce-assistant")
 
-app = FastAPI(title="E-Commerce Order Support Assistant", version="1.0.0")
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+engine = OllamaEngine()
+embedder = OllamaEmbedder()
+retriever = Retriever(embedder)
+manager = ConversationManager(engine=engine, retriever=retriever)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the on-disk index (never raises: a missing index just disables RAG and
+    # the assistant keeps working). Warm the embedding model in the background so
+    # the first real query doesn't pay the model-load cost, without delaying startup.
+    if retriever.load():
+        app.state.warmup = asyncio.create_task(retriever.warm_up())
+    yield
+    await embedder.aclose()
+
+
+app = FastAPI(title="E-Commerce Order Support Assistant", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,17 +67,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-engine = OllamaEngine()
-manager = ConversationManager(engine=engine)
-
-
 @app.get("/api/health", response_model=HealthResponse)
 async def health():
     reachable = await engine.health_check()
+    r = manager.retriever
+    ready = bool(r and r.ready)
     return HealthResponse(
-        status="ok" if reachable else "degraded",
+        status="ok" if reachable and ready else "degraded",
         ollama_reachable=reachable,
         model=OLLAMA_MODEL,
+        retrieval_ready=ready,
+        index_chunks=len(r.store) if ready else 0,
+        embed_model=EMBED_MODEL,
     )
 
 
@@ -179,4 +204,4 @@ async def _safe_send(websocket: WebSocket, data: dict):
 
 
 # Serve the simple chat frontend at /
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

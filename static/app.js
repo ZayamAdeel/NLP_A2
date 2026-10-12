@@ -18,14 +18,6 @@ function addBubble(role, text) {
   return div;
 }
 
-function addMeta(text) {
-  const div = document.createElement("div");
-  div.className = "meta";
-  div.textContent = text;
-  chatWindow.appendChild(div);
-  chatWindow.scrollTop = chatWindow.scrollHeight;
-}
-
 function setSending(isSending) {
   sendBtn.disabled = isSending;
   input.disabled = isSending;
@@ -66,6 +58,63 @@ function connectSocket() {
   };
 }
 
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;   // textContent only: never inject HTML
+  return node;
+}
+
+// Citations: one chip per source the answer was grounded in; click to read the excerpt.
+function buildSources(sources) {
+  const wrap = el("div", "sources");
+  wrap.appendChild(el("span", "sources-label", "Sources"));
+  const row = el("div", "src-row");
+  wrap.appendChild(row);
+  sources.forEach((s) => {
+    const panel = el("div", "src-detail");
+    panel.hidden = true;
+    panel.appendChild(el("div", "src-path", `${s.doc_id} (relevance ${Number(s.score).toFixed(2)})`));
+    panel.appendChild(el("div", "src-snippet", s.snippet));
+
+    const chip = el("button", "src-chip", `[${s.n}] ${s.title}`);
+    chip.type = "button";
+    chip.setAttribute("aria-expanded", "false");
+    chip.addEventListener("click", () => {
+      panel.hidden = !panel.hidden;
+      chip.setAttribute("aria-expanded", String(!panel.hidden));
+    });
+    row.appendChild(chip);
+    wrap.appendChild(panel);
+  });
+  return wrap;
+}
+
+function renderExtras(msg) {
+  const r = msg.retrieval;
+  const extra = el("div", "msg-extra");
+
+  if (msg.sources && msg.sources.length) {
+    extra.appendChild(buildSources(msg.sources));
+  } else if (r && r.status === "no_match") {
+    extra.appendChild(el("div", "src-note", "No matching documents found, so this answer is not based on the knowledge base."));
+  } else if (r && r.status === "unavailable") {
+    extra.appendChild(el("div", "src-note", "The knowledge base could not be reached, so this answer is not based on documents."));
+  }
+
+  const parts = [];
+  if (r && r.status !== "disabled" && r.status !== "skipped") {
+    parts.push(`retrieval ${r.ms} ms${r.cached ? " (cached)" : ""}`);
+  }
+  if (msg.time_to_first_token != null) parts.push(`first token ${msg.time_to_first_token} s`);
+  if (msg.tokens_per_second != null) parts.push(`${msg.tokens_per_second} tokens/s`);
+  if (msg.total_time != null) parts.push(`generation ${msg.total_time} s`);
+  if (parts.length) extra.appendChild(el("div", "meta", parts.join(", ")));
+
+  chatWindow.appendChild(extra);
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+}
+
 function handleServerEvent(msg) {
   switch (msg.type) {
     case "stage":
@@ -84,10 +133,7 @@ function handleServerEvent(msg) {
       currentAssistantBubble = null;
       break;
     case "done": {
-      const ttft = msg.time_to_first_token != null ? `${msg.time_to_first_token}s TTFT` : "";
-      const tps = msg.tokens_per_second != null ? `${msg.tokens_per_second} tok/s` : "";
-      const total = msg.total_time != null ? `${msg.total_time}s total` : "";
-      addMeta([ttft, tps, total].filter(Boolean).join(" · "));
+      renderExtras(msg);
       currentAssistantBubble = null;
       setSending(false);
       break;

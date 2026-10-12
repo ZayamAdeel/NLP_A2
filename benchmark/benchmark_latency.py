@@ -23,7 +23,7 @@ from app.llm_engine import OllamaEngine
 PROMPTS = [
     "Where is my order? It's order number BC-77120.",
     "Can I return a pair of headphones I bought 10 days ago?",
-    "Does the Brightcart Blender Pro come in a smaller size?",
+    "Does the KeyCraft K87 keyboard work on macOS?",
     "What's your shipping policy for express delivery?",
     "I want to cancel an order I placed 5 minutes ago, is that possible?",
 ]

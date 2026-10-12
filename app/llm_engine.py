@@ -12,7 +12,8 @@ from typing import AsyncIterator, Optional
 
 import httpx
 
-from app.config import GENERATION_OPTIONS, OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_TIMEOUT
+from app.config import (GENERATION_OPTIONS, OLLAMA_HOST, OLLAMA_KEEP_ALIVE, OLLAMA_MODEL,
+                        OLLAMA_TIMEOUT)
 
 
 class LLMEngineError(Exception):
@@ -24,12 +25,18 @@ class GenerationMetrics:
     time_to_first_token: Optional[float] = None
     total_time: Optional[float] = None
     output_tokens_estimate: int = 0
+    eval_seconds: Optional[float] = None  # Ollama's pure decode time, when reported
 
     @property
     def tokens_per_second(self) -> Optional[float]:
-        if self.total_time and self.total_time > 0:
-            return round(self.output_tokens_estimate / self.total_time, 2)
-        return None
+        """Decode speed: tokens / decode time (excludes prompt processing)."""
+        if self.eval_seconds:
+            dur = self.eval_seconds
+        elif self.total_time and self.time_to_first_token is not None:
+            dur = self.total_time - self.time_to_first_token
+        else:
+            return None
+        return round(self.output_tokens_estimate / dur, 2) if dur > 0 else None
 
 
 class OllamaEngine:
@@ -69,6 +76,7 @@ class OllamaEngine:
             "model": self.model,
             "messages": messages,
             "stream": True,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
             "options": {**GENERATION_OPTIONS, **(options or {})},
         }
 
@@ -117,9 +125,8 @@ class OllamaEngine:
                             if chunk.get("eval_count"):
                                 metrics.output_tokens_estimate = chunk["eval_count"]
                             if chunk.get("eval_duration"):
-                                metrics.total_time = round(
-                                    chunk["eval_duration"] / 1e9, 4
-                                )
+                                # total_time stays wall-clock; decode time is kept apart
+                                metrics.eval_seconds = chunk["eval_duration"] / 1e9
                             break
         except httpx.ConnectError as e:
             raise LLMEngineError(

@@ -13,9 +13,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app import main as main_module
 from app.conversation_manager import ConversationManager
+from app.rag.retriever import Hit, RetrievalResult
+from fakes import StaticRetriever
+
+HIT = Hit("returns/returns_033_eligibility.md#0", "returns/returns_033_eligibility.md",
+          "Return Eligibility Policy", "returns",
+          "Return Eligibility Policy\nItems may be returned within 30 days after delivery.", 0.71)
 
 
 class FakeMetrics:
@@ -44,7 +51,9 @@ class FakeEngine:
 def patch_engine(monkeypatch):
     fake = FakeEngine()
     monkeypatch.setattr(main_module, "engine", fake)
-    monkeypatch.setattr(main_module, "manager", ConversationManager(engine=fake))
+    monkeypatch.setattr(
+        main_module, "manager",
+        ConversationManager(engine=fake, retriever=StaticRetriever(RetrievalResult("ok", [HIT], ms=3.2))))
     yield
 
 
@@ -59,6 +68,15 @@ def test_health_endpoint(client):
     body = resp.json()
     assert body["status"] == "ok"
     assert body["ollama_reachable"] is True
+    assert body["retrieval_ready"] is True
+    assert body["index_chunks"] == 50
+
+
+def test_health_degraded_when_index_missing(client):
+    main_module.manager.retriever.ready = False
+    body = client.get("/api/health").json()
+    assert body["status"] == "degraded"
+    assert body["retrieval_ready"] is False
 
 
 def test_create_and_fetch_session(client):
@@ -136,3 +154,45 @@ def test_websocket_off_topic_message_blocked(client):
             if msg["type"] == "blocked":
                 break
         assert any(e["type"] == "blocked" for e in events)
+
+
+def _read_until_done(ws, limit=30):
+    events = []
+    for _ in range(limit):
+        msg = json.loads(ws.receive_text())
+        events.append(msg)
+        if msg["type"] in ("done", "error", "blocked"):
+            break
+    return events
+
+
+def test_done_event_carries_citations_and_retrieval_info(client):
+    session_id = client.post("/api/session").json()["session_id"]
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(json.dumps({"type": "message", "session_id": session_id,
+                                 "text": "Can I return an unused item?"}))
+        events = _read_until_done(ws)
+    done = events[-1]
+    assert done["type"] == "done"
+    # Assignment 1 fields unchanged ...
+    for key in ("time_to_first_token", "total_time", "tokens_per_second", "stage"):
+        assert key in done
+    # ... plus the additive citation fields
+    assert done["sources"][0]["doc_id"] == "returns/returns_033_eligibility.md"
+    assert done["sources"][0]["n"] == 1
+    assert done["retrieval"]["status"] == "ok"
+    # event vocabulary is exactly what Assignment 1 clients already understand
+    assert {e["type"] for e in events} <= {"stage", "token", "done"}
+
+
+def test_streaming_survives_retrieval_failure(client):
+    main_module.manager.retriever.result = RetrievalResult("unavailable", detail="embedder down")
+    session_id = client.post("/api/session").json()["session_id"]
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(json.dumps({"type": "message", "session_id": session_id,
+                                 "text": "How long does express shipping take?"}))
+        events = _read_until_done(ws)
+    assert events[-1]["type"] == "done"
+    assert events[-1]["sources"] == []
+    assert events[-1]["retrieval"]["status"] == "unavailable"
+    assert any(e["type"] == "token" for e in events)

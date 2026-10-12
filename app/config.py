@@ -29,11 +29,9 @@ OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))
 # the conversation runs, which matters a lot for CPU inference latency.
 MAX_TURNS_IN_WINDOW = int(os.getenv("MAX_TURNS_IN_WINDOW", "6"))
 
-# Rough token budget for the whole prompt (system + summary + window). This is
-# a heuristic (1 token ~= 4 chars for English) since we deliberately avoid
-# pulling in a tokenizer dependency just to estimate length.
-MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "1800"))
-CHARS_PER_TOKEN_ESTIMATE = 4
+# Token counts are estimated as len(text) / CHARS_PER_TOKEN_ESTIMATE (no tokenizer
+# dependency). The prompt budget itself is derived from num_ctx; see the RAG section.
+CHARS_PER_TOKEN_ESTIMATE = 3.5  # conservative: numbers/punctuation tokenize worse than prose
 
 # When the window needs to be compacted, we ask the *same* local model to
 # summarize the turns falling out of the window. This is plain prompting of
@@ -49,4 +47,53 @@ GENERATION_OPTIONS = {
     "top_p": 0.9,
     "repeat_penalty": 1.1,
     "num_ctx": 4096,
+    "num_predict": 320,  # hard cap on answer length: bounds worst-case latency
 }
+
+# Keep models resident between turns; on CPU a cold reload costs several seconds.
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+
+
+# =============================================================================
+# RAG (Assignment 2)
+# =============================================================================
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CORPUS_DIR = Path(os.getenv("CORPUS_DIR", PROJECT_ROOT / "data" / "corpus"))
+INDEX_DIR = Path(os.getenv("INDEX_DIR", PROJECT_ROOT / "index"))
+
+# ---- Embedding model (served by the same local Ollama) ----------------------
+# `all-minilm` = 22M-param MiniLM, 384-dim, 256-token limit. Pull with:
+#   ollama pull all-minilm
+EMBED_MODEL = os.getenv("EMBED_MODEL", "all-minilm")
+EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "5"))
+
+# ---- Chunking ---------------------------------------------------------------
+# Max ~600 chars (~150-170 tokens) keeps every chunk well under MiniLM's
+# 256-token limit even after the title prefix is added.
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "600"))
+CHUNK_OVERLAP_SENTENCES = int(os.getenv("CHUNK_OVERLAP_SENTENCES", "1"))
+# Markdown sections dropped before embedding (identical boilerplate in every
+# corpus file would otherwise inflate similarity for unrelated queries).
+BOILERPLATE_SECTIONS = {"source"}
+
+# ---- Retrieval --------------------------------------------------------------
+TOP_K = int(os.getenv("TOP_K", "4"))
+# Cosine-similarity floor. A query whose BEST chunk scores below this is
+# treated as "no relevant match". MUST be calibrated per embedding model:
+#   python scripts/eval_retrieval.py   (prints score distributions + suggestion)
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.30"))
+RETRIEVAL_TIMEOUT = float(os.getenv("RETRIEVAL_TIMEOUT", "1.5"))  # seconds, embed+search
+CACHE_SIZE = int(os.getenv("RETRIEVAL_CACHE_SIZE", "256"))
+# Circuit breaker: after N consecutive failures skip retrieval for COOLDOWN s
+# so a dead embedder costs ~0 ms per turn instead of RETRIEVAL_TIMEOUT.
+BREAKER_FAILURES = int(os.getenv("BREAKER_FAILURES", "3"))
+BREAKER_COOLDOWN = float(os.getenv("BREAKER_COOLDOWN", "30"))
+
+# ---- Context-window budget (num_ctx = GENERATION_OPTIONS["num_ctx"]) --------
+# prompt budget = num_ctx - RESPONSE_RESERVE_TOKENS
+# priority when packing: system > current question > retrieved chunks
+#                        (capped at RAG_MAX_CONTEXT_TOKENS) > recent history
+RESPONSE_RESERVE_TOKENS = int(os.getenv("RESPONSE_RESERVE_TOKENS", "512"))
+RAG_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_MAX_CONTEXT_TOKENS", "800"))

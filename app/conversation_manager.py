@@ -1,25 +1,31 @@
 """
 Conversation Manager: session handling, history management, prompt
-orchestration, and turn-taking logic. This is the "brain" that sits between
-the WebSocket layer and the LLM engine.
+orchestration, turn-taking logic and (Assignment 2) retrieval integration.
+It sits between the WebSocket layer, the Retriever and the LLM engine.
 
-No tools, agents, or RAG are used anywhere in this file -- only in-memory
-Python state and prompt construction.
+Per-turn pipeline:
+  off-topic guard -> stage update -> retrieve -> budgeted prompt build ->
+  stream generation -> record turn -> `done` (+sources) -> maybe summarize
 """
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 
 from app.config import (
     CHARS_PER_TOKEN_ESTIMATE,
-    MAX_PROMPT_TOKENS,
+    GENERATION_OPTIONS,
     MAX_TURNS_IN_WINDOW,
+    RAG_MAX_CONTEXT_TOKENS,
+    RESPONSE_RESERVE_TOKENS,
     SUMMARY_TRIGGER_TURNS,
 )
 from app.domain import (
+    ANSWER_FROM_EXCERPTS_NOTE,
     BASE_SYSTEM_PROMPT,
     GREETING_MESSAGE,
     INTENT_KEYWORDS,
+    NO_MATCH_NOTE,
     OFF_TOPIC_KEYWORDS,
     OFF_TOPIC_REDIRECT,
     STAGE_CLOSING,
@@ -29,17 +35,25 @@ from app.domain import (
     STAGE_INFO_GATHERING,
     STAGE_INTENT_ID,
     STAGE_RESOLUTION,
+    UNAVAILABLE_NOTE,
 )
 from app.llm_engine import OllamaEngine
+from app.rag.retriever import Hit, RetrievalResult, Retriever
 
 CLOSING_TRIGGERS = ["bye", "goodbye", "thank you, that's all", "thats all", "no that's all",
                      "nothing else", "that's everything", "thanks that's all"]
 CONFIRM_POSITIVE = ["yes", "yep", "yeah", "sure", "please", "go ahead"]
 CONFIRM_NEGATIVE = ["no", "nope", "not really", "that's all", "nothing else", "no thanks"]
 
+# Tokens reserved for the per-turn note + labels when budgeting the prompt.
+NOTE_RESERVE_TOKENS = 150
+# Messages shorter than this are treated as follow-ups ("yes please", "what about silver?")
+# and get the previous user message prepended to the retrieval query.
+SHORT_FOLLOWUP_WORDS = 6
 
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // CHARS_PER_TOKEN_ESTIMATE)
+
+def estimate_tokens(text: str) -> int:
+    return int(len(text) / CHARS_PER_TOKEN_ESTIMATE) + 1
 
 
 def _detect_intent(message: str) -> str | None:
@@ -53,11 +67,55 @@ def _detect_intent(message: str) -> str | None:
     return best if scores[best] > 0 else None
 
 
+# Whole-word matching: plain substring matching wrongly blocked real support
+# questions ("investigate" contains "invest"; "contact assistance" contains "act as").
+_OFF_TOPIC_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in OFF_TOPIC_KEYWORDS) + r")\b", re.IGNORECASE)
+
+
 def is_off_topic(message: str) -> bool:
     """Fast, deterministic first-pass filter. The system prompt handles
     subtler cases the model itself must catch."""
-    lower = message.lower()
-    return any(kw in lower for kw in OFF_TOPIC_KEYWORDS)
+    return bool(_OFF_TOPIC_RE.search(message))
+
+
+# Messages made ONLY of these words need no knowledge-base lookup.
+_SMALLTALK_WORDS = {
+    "hi", "hello", "hey", "thanks", "thank", "thx", "you", "ok", "okay", "cool", "great",
+    "awesome", "perfect", "nice", "bye", "goodbye", "good", "morning", "afternoon", "evening",
+    "see", "later", "so", "much", "very", "ava", "there", "that's", "thats", "all",
+    "nothing", "else", "no",
+}
+
+
+def is_smalltalk(message: str) -> bool:
+    words = re.findall(r"[a-z']+", message.lower())
+    return 0 < len(words) <= 6 and all(w in _SMALLTALK_WORDS for w in words)
+
+
+def pack_excerpts(hits: list[Hit], budget_tokens: int) -> list[tuple[int, Hit, str]]:
+    """
+    Fit retrieved chunks into `budget_tokens`, best-ranked first, never splitting a
+    chunk mid-way except when even the best one is too big (then it is cut at a
+    sentence boundary). Returns [(number, hit, rendered_block)].
+    """
+    packed, used = [], 0
+    for hit in hits:
+        block = f"[{len(packed) + 1}] {hit.text}"
+        cost = estimate_tokens(block)
+        if used + cost <= budget_tokens:
+            packed.append((len(packed) + 1, hit, block))
+            used += cost
+        elif not packed and budget_tokens > 20:
+            max_chars = int(budget_tokens * CHARS_PER_TOKEN_ESTIMATE)
+            cut = block[:max_chars]
+            if ". " in cut:
+                cut = cut[: cut.rfind(". ") + 1]
+            packed.append((1, hit, cut.rstrip() + " [truncated]"))
+            break
+        else:
+            break  # keep rank order: stop at the first chunk that does not fit
+    return packed
 
 
 @dataclass
@@ -91,9 +149,10 @@ class ConversationManager:
     info_gathering for the new topic without losing the message history).
     """
 
-    def __init__(self, engine: OllamaEngine | None = None):
+    def __init__(self, engine: OllamaEngine | None = None, retriever: Retriever | None = None):
         self.sessions: dict[str, Session] = {}
         self.engine = engine or OllamaEngine()
+        self.retriever = retriever  # None => pure Assignment-1 behaviour (no RAG)
 
     # ---- Session lifecycle --------------------------------------------------
     def create_session(self) -> Session:
@@ -175,48 +234,80 @@ class ConversationManager:
                 session.stage = STAGE_GREETING
             return
 
-    # ---- Memory management (Phase II write-up lives in README, this is the
-    # implementation of that scheme) ------------------------------------------
-    async def _build_messages(self, session: Session) -> list[dict]:
-        stage_hint = STAGE_GUIDANCE.get(session.stage, "")
-        system_content = (
-            BASE_SYSTEM_PROMPT
-            + f"\n\nCurrent conversation stage: {session.stage}. Guidance: {stage_hint}"
-        )
-        if session.active_intent:
-            system_content += f"\nCurrent topic the customer is asking about: {session.active_intent}."
+    # ---- Retrieval ------------------------------------------------------------
+    def _retrieval_query(self, session: Session, user_message: str) -> str:
+        """Short follow-ups ("yes please", "what about silver?") are meaningless alone,
+        so prepend the previous user message to give the embedding its topic."""
+        if len(user_message.split()) < SHORT_FOLLOWUP_WORDS:
+            # Anchor on the latest *substantive* user message, so a chain of short
+            # follow-ups ("yes please" -> "and exchanges?") keeps the original topic.
+            user_turns = [t.content for t in reversed(session.history) if t.role == "user"]
+            anchor = next((c for c in user_turns if len(c.split()) >= SHORT_FOLLOWUP_WORDS),
+                          user_turns[0] if user_turns else "")
+            if anchor:
+                return f"{anchor} {user_message}"
+        return user_message
 
-        messages = [{"role": "system", "content": system_content}]
+    async def _retrieve(self, session: Session, user_message: str) -> RetrievalResult:
+        if self.retriever is None:
+            return RetrievalResult("disabled")
+        if is_smalltalk(user_message):
+            return RetrievalResult("skipped")
+        return await self.retriever.retrieve(self._retrieval_query(session, user_message))
 
+    # ---- Prompt construction + context-window budget --------------------------
+    def _build_messages(self, session: Session, user_message: str, result: RetrievalResult):
+        """
+        Build the exact `messages` list for this turn within the context window.
+
+        Budget = num_ctx - RESPONSE_RESERVE_TOKENS. Priority when space is short:
+          1. system prompt (+ rolling summary)        always kept
+          2. the current customer message             always kept
+          3. retrieved excerpts, capped at RAG_MAX_CONTEXT_TOKENS, best-ranked first
+          4. recent history, newest first -- the OLDEST turns are dropped first
+
+        Retrieved text is injected into the final user message only (never stored in
+        history), so excerpts from old turns cannot pile up, and the static system
+        prompt + history stay a stable prefix the LLM server can reuse from its cache.
+        """
+        budget = GENERATION_OPTIONS["num_ctx"] - RESPONSE_RESERVE_TOKENS
+        messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
         if session.rolling_summary:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": f"Summary of earlier conversation so far: {session.rolling_summary}",
-                }
-            )
+            messages.append({"role": "system",
+                             "content": f"Summary of the earlier conversation: {session.rolling_summary}"})
 
-        # Sliding window: only the most recent MAX_TURNS_IN_WINDOW turn-pairs
-        # go in verbatim, so prompt length stays roughly constant regardless
-        # of how long the session has been running.
-        window = session.history[-(MAX_TURNS_IN_WINDOW * 2):]
-        for turn in window:
-            messages.append({"role": turn.role, "content": turn.content})
+        fixed = (sum(estimate_tokens(m["content"]) for m in messages)
+                 + estimate_tokens(user_message) + NOTE_RESERVE_TOKENS)
+        remaining = max(0, budget - fixed)
 
-        # Defensive final trim purely on estimated size, in case a single
-        # message in the window is unusually long.
-        total_tokens = sum(_estimate_tokens(m["content"]) for m in messages)
-        while total_tokens > MAX_PROMPT_TOKENS and len(messages) > 2:
-            # Drop the oldest non-system message.
-            for i, m in enumerate(messages):
-                if m["role"] != "system":
-                    removed = messages.pop(i)
-                    total_tokens -= _estimate_tokens(removed["content"])
-                    break
-            else:
+        packed = []
+        if result.status == "ok":
+            packed = pack_excerpts(result.hits, min(RAG_MAX_CONTEXT_TOKENS, remaining))
+        remaining -= sum(estimate_tokens(block) for _, _, block in packed)
+
+        kept = []
+        for turn in reversed(session.history[-(MAX_TURNS_IN_WINDOW * 2):]):
+            cost = estimate_tokens(turn.content)
+            if cost > remaining:
                 break
+            kept.append(turn)
+            remaining -= cost
+        kept.reverse()
+        while kept and kept[0].role == "assistant":
+            kept.pop(0)  # never start the visible history mid-exchange
+        messages += [{"role": t.role, "content": t.content} for t in kept]
 
-        return messages
+        if packed:
+            note = ANSWER_FROM_EXCERPTS_NOTE
+            body = "Knowledge base excerpts:\n" + "\n\n".join(b for _, _, b in packed) + "\n\n"
+        elif result.status in ("ok", "no_match"):
+            note, body = NO_MATCH_NOTE, ""
+        elif result.status == "unavailable":
+            note, body = UNAVAILABLE_NOTE, ""
+        else:  # skipped / disabled: plain conversation, use the stage guidance
+            note, body = f"[Stage: {session.stage}. {STAGE_GUIDANCE.get(session.stage, '')}]", ""
+        messages.append({"role": "user", "content": f"{body}{note}\n\nCustomer message: {user_message}"})
+        return messages, packed
 
     async def _maybe_summarize(self, session: Session):
         """
@@ -266,8 +357,8 @@ class ConversationManager:
         Async generator. Yields (event_type, payload) tuples:
           ("stage", stage_name)
           ("token", text_chunk)
-          ("done", metrics_dict)
-          ("blocked", redirect_message)   -- off-topic, no LLM call made
+          ("done", metrics_dict)          includes `sources` and `retrieval`
+          ("blocked", redirect_message)   -- off-topic, no retrieval / LLM call made
         """
         session.touch()
         session.turn_count += 1
@@ -280,13 +371,10 @@ class ConversationManager:
             return
 
         self._advance_stage(session, user_message)
-        session.history.append(Turn("user", user_message))
-
-        await self._maybe_summarize(session)
-
-        messages = await self._build_messages(session)
-
         yield ("stage", session.stage)
+
+        result = await self._retrieve(session, user_message)
+        messages, packed = self._build_messages(session, user_message, result)
 
         full_response = ""
         final_metrics = None
@@ -295,7 +383,11 @@ class ConversationManager:
             final_metrics = metrics
             yield ("token", token)
 
+        # Record the exchange only after a successful generation, so an LLM error
+        # does not leave an orphaned user turn in the history.
+        session.history.append(Turn("user", user_message))
         session.history.append(Turn("assistant", full_response))
+
         yield (
             "done",
             {
@@ -303,5 +395,15 @@ class ConversationManager:
                 "total_time": final_metrics.total_time if final_metrics else None,
                 "tokens_per_second": final_metrics.tokens_per_second if final_metrics else None,
                 "stage": session.stage,
+                "sources": [
+                    {"n": n, "title": h.title, "doc_id": h.doc_id, "category": h.category,
+                     "score": h.score, "snippet": h.text.split("\n", 1)[-1][:300]}
+                    for n, h, _ in packed
+                ],
+                "retrieval": {"status": result.status, "ms": result.ms, "cached": result.cached},
             },
         )
+
+        # Housekeeping AFTER the answer is complete, so a summarization call never
+        # delays the user's response.
+        await self._maybe_summarize(session)

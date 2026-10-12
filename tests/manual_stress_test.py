@@ -47,8 +47,10 @@ async def concurrent_user(user_id: int, message: str):
             if msg["type"] in ("done", "error", "blocked"):
                 break
         elapsed = time.perf_counter() - start
+        r = msg.get("retrieval") or {}
         print(f"[user {user_id}] done in {elapsed:.2f}s, {tokens} token chunks, "
-              f"final event={msg['type']}")
+              f"final event={msg['type']}, retrieval={r.get('status')} {r.get('ms')} ms, "
+              f"sources={[s['doc_id'].split('/')[-1] for s in msg.get('sources', [])]}")
 
 
 async def test_concurrency(n_users: int = 4):
@@ -105,7 +107,29 @@ async def test_mid_stream_disconnect():
     print(f"Server still responsive after abrupt disconnect: {healthy}")
 
 
+async def test_rag_paths():
+    """Grounded answer (sources), no-match query (no sources), huge message (budget)."""
+    print("\n--- RAG paths ---")
+    cases = {
+        "grounded": "Can I use the WaveSound H200 headphones with my laptop?",
+        "no match": "Do you sell dishwashers and refrigerators?",
+        "max-length message": "Tell me about shipping. " + "I really need to know. " * 160,
+    }
+    for label, text in cases.items():
+        session_id = await new_session()
+        async with websockets.connect(BASE_WS) as ws:
+            await ws.send(json.dumps({"type": "message", "session_id": session_id, "text": text[:4000]}))
+            while True:
+                msg = json.loads(await ws.recv())
+                if msg["type"] in ("done", "error", "blocked"):
+                    break
+        r = msg.get("retrieval") or {}
+        print(f"[{label}] final={msg['type']} retrieval={r.get('status')} "
+              f"sources={len(msg.get('sources', []))}")
+
+
 async def main():
+    await test_rag_paths()
     await test_malformed_message()
     await test_unknown_session()
     await test_mid_stream_disconnect()

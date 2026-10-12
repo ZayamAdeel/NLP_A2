@@ -6,3 +6,6 @@ python-multipart==0.0.9
 pytest==8.3.3
 pytest-asyncio==0.24.0
 websockets==13.1
+numpy>=1.26
+# Optional: if installed, the vector store uses FAISS IndexFlatIP; otherwise NumPy (identical exact results)
+faiss-cpu>=1.8
