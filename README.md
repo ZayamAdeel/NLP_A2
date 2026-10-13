@@ -1,440 +1,494 @@
-# Brightcart Support Assistant — E-Commerce Order Support Chatbot
+# BrightCart Support Assistant — Assignment 2 (RAG)
 
-A fully local, CPU-only conversational AI system for **Assignment 1**: a real-time,
-streaming, multi-turn e-commerce order-support chatbot built with FastAPI + a
-quantized local LLM served by **Ollama**. No cloud model APIs, no tools, no
-agents, no RAG — every response comes from prompt orchestration and
-conversational memory alone, as required.
+A local, CPU-oriented e-commerce support chatbot built with **FastAPI**, **WebSockets**, and **Ollama**.
 
----
+Assignment 1 introduced prompt orchestration and conversation memory. Assignment 2 adds **Retrieval-Augmented Generation (RAG)** over a 50-document BrightCart knowledge base. Before generating an answer, Ava retrieves relevant excerpts and can show the documents used as citations.
 
-## 1. Business Use Case
-
-**Domain: E-Commerce Order Support Assistant** for a fictional store,
-**Brightcart** (electronics & home goods).
-
-The assistant, "Ava", helps customers with exactly three things:
-
-1. **Product questions** — features, sizing, compatibility, stock, general advice.
-2. **Order tracking** — order status, delivery windows.
-3. **Returns, refunds, exchanges & shipping policy** — eligibility, timelines, cancellations.
-
-It explicitly refuses anything outside that scope (weather, coding help,
-medical/legal advice, general trivia, jailbreak attempts, etc.) and redirects
-the user back to supported topics. This domain was chosen because it has
-concrete, checkable policies (so correctness is easy to grade), natural
-multi-turn structure (greeting → clarify → resolve → confirm → close), and a
-very plausible "topic switch mid-conversation" case (a customer asking about
-an order, then suddenly asking about a product) that stress-tests the
-conversation manager's state handling.
-
-### Example Dialogues
-
-**1. Order tracking**
-
-```
-User: Hi, where is my order?
-Ava:  Hi! Happy to help. Could you share your order number so I can walk you
-      through what to expect?
-User: It's BC-88213, placed 4 days ago.
-Ava:  Thanks! For standard shipping, orders typically arrive within 3-5
-      business days, so BC-88213 should be right on track. I don't have live
-      tracking access in this demo, but you'd see real-time status on the
-      tracking link in your confirmation email. Anything else I can help with?
-```
-
-**2. Return/policy question, then a mid-conversation topic switch**
-
-```
-User: Can I return a blender I bought 20 days ago?
-Ava:  Yes! We accept returns within 30 days of delivery as long as it's unused
-      and in its original packaging, so you're well within the window. Want
-      me to walk you through the return steps?
-User: Actually, does the Brightcart Air Fryer XL come in a smaller size?
-Ava:  Good question! I don't have live catalog data in this demo, but the Air
-      Fryer XL line typically also offers a compact model — I'd recommend
-      checking the product page for exact size options. Was there anything
-      else on the return, or is this all for now?
-```
-
-**3. Off-topic redirect**
-
-```
-User: By the way, what's the weather like today?
-Ava:  I'm Ava, Brightcart's order support assistant, so I can only help with
-      product questions, order tracking, and returns/shipping. Is there
-      anything along those lines I can help you with?
-User: Okay fine — can I cancel an order I placed 10 minutes ago?
-Ava:  Yes, cancellations are possible within 1 hour of placing an order as
-      long as it hasn't shipped yet. I'd recommend cancelling right away from
-      your order page, or let me know and I can explain the steps.
-```
-
-(All three dialogues above are also defined as data in `app/domain.py` under
-`EXAMPLE_DIALOGUES`, and the exact off-topic redirect text and policy facts
-come straight from the live system prompt, so these transcripts match what
-the running system actually says.)
-
-### Conversation Flow Design
-
-The assistant moves through **six domain-specific stages**, tracked per
-session in `ConversationManager._advance_stage` (`app/conversation_manager.py`):
-
-| Stage | What happens |
+| Component | Implementation |
 |---|---|
-| `greeting` | Ava greets the customer and asks how she can help (order / product / policy). |
-| `intent_identification` | If the first message was vague ("I need help"), Ava figures out which of the 3 supported topics applies. |
-| `info_gathering` | Ava asks for the minimum info needed (order number, product name, issue). |
-| `resolution` | Ava gives a clear, policy-accurate answer or next step. |
-| `confirmation` | Ava checks whether that fully answered the question. |
-| `closing` | Ava wraps up; saying "bye"/"no that's all" gets here directly from `confirmation`. |
+| Domain | Fictional electronics and accessories store, BrightCart |
+| Chat model | `qwen2.5:1.5b-instruct-q4_K_M` via Ollama |
+| Embedding model | `all-minilm` via Ollama |
+| Vector search | Exact inner-product search with FAISS when available; NumPy fallback |
+| Backend and interface | FastAPI, WebSocket streaming, HTML/CSS/JavaScript UI |
+| Knowledge base | 50 Markdown documents across six categories |
+| External LLM APIs | None; models run locally through Ollama |
 
-**Handling topic switches mid-conversation:** every incoming message is
-passed through a lightweight rule-based intent detector
-(`_detect_intent`, keyword-scored against `INTENT_KEYWORDS`). If the customer
-is already in `info_gathering` / `resolution` / `confirmation` for one topic
-(say, `order_tracking`) and the detected intent of the new message is a
-*different* supported topic (say, `returns_shipping`), the manager:
+## Contents
 
-1. Updates `session.active_intent` to the new topic.
-2. Resets `session.stage` back to `info_gathering` for that new topic.
-3. **Does not** erase conversation history — the full turn history (and
-   rolling summary, see §3) is still sent to the model, so Ava remains
-   contextually aware of the earlier topic even while helping with the new one.
-
-This is exercised directly in `tests/test_conversation_manager.py::test_topic_switch_mid_conversation_resets_to_info_gathering`.
-
-**Handling off-topic / out-of-domain messages:** a message is checked against
-a fast keyword denylist (`is_off_topic`, in `conversation_manager.py`) for
-obviously unrelated topics (weather, politics, homework, jailbreak phrases
-like "ignore previous instructions", etc.). If it matches, the system
-**short-circuits before calling the LLM at all** — no token is generated, the
-canned `OFF_TOPIC_REDIRECT` message is sent immediately (this both saves CPU
-cycles and guarantees the refusal is 100% consistent). Subtler off-topic
-requests that slip past the keyword filter are still caught by the system
-prompt's explicit instruction to decline and redirect (see `BASE_SYSTEM_PROMPT`
-in `app/domain.py`).
+1. [Use case and conversation design](#1-use-case-and-conversation-design)
+2. [Architecture and project structure](#2-architecture-and-project-structure)
+3. [Models and vector search](#3-models-and-vector-search)
+4. [Setup and run](#4-setup-and-run)
+5. [Build and update the index](#5-build-and-update-the-index)
+6. [How retrieval works](#6-how-retrieval-works)
+7. [WebSocket and REST API](#8-websocket-and-rest-api)
+8. [Tests](#9-tests)
+9. [Changes since Assignment 1](#10-changes-since-assignment-1)
+10. [Configuration reference](#11-configuration-reference)
 
 ---
 
-## 2. System Architecture
+## 1. Use case and conversation design
 
-```
-┌──────────────────┐      WebSocket (JSON)      ┌──────────────────────────┐
-│  Web Chat UI      │◄──────────────────────────►│      FastAPI Server       │
-│  (static/*.html,  │   /ws/chat                 │      app/main.py          │
-│   app.js, css)    │   REST: /api/session, ...  │                            │
-└──────────────────┘                             │  ┌──────────────────────┐ │
-                                                  │  │ Conversation Manager  │ │
-                                                  │  │ (sessions, stages,    │ │
-                                                  │  │  memory windowing,    │ │
-                                                  │  │  off-topic guard)     │ │
-                                                  │  │ conversation_manager.py│ │
-                                                  │  └──────────┬───────────┘ │
-                                                  │             │ messages[]   │
-                                                  │  ┌──────────▼───────────┐ │
-                                                  │  │     LLM Engine        │ │
-                                                  │  │  (async streaming     │ │
-                                                  │  │   HTTP client)        │ │
-                                                  │  │   llm_engine.py       │ │
-                                                  │  └──────────┬───────────┘ │
-                                                  └─────────────┼─────────────┘
-                                                                │ HTTP /api/chat (stream)
-                                                     ┌──────────▼───────────┐
-                                                     │   Ollama (local)      │
-                                                     │ qwen2.5:1.5b-instruct │
-                                                     │        Q4_K_M         │
-                                                     └────────────────────────┘
-```
+BrightCart is a fictional electronics and accessories store. Its support assistant, **Ava**, helps with:
 
-- **Frontend** (`static/`): plain HTML/CSS/vanilla JS chat widget. Opens a
-  WebSocket, streams tokens into the active bubble as they arrive, shows the
-  current conversation stage, and has a "New chat" reset button.
-- **Backend API** (`app/main.py`): FastAPI app exposing REST endpoints for
-  session lifecycle and a single `/ws/chat` WebSocket endpoint for real-time
-  streaming chat. Fully `async`.
-- **Conversation Manager** (`app/conversation_manager.py`): owns all
-  in-memory `Session` objects, drives the stage machine described above,
-  implements the memory-management scheme (§3), and builds the exact
-  `messages` list sent to the model each turn.
-- **LLM Engine** (`app/llm_engine.py`): a thin async `httpx` streaming client
-  for Ollama's native `/api/chat` endpoint — not LangChain, not a tool-calling
-  wrapper, just messages in / token stream out, which keeps the "no tools/RAG"
-  constraint unambiguous.
+1. **Product questions:** specifications, compatibility, setup, and troubleshooting.
+2. **Orders:** tracking guidance, cancellations, edits, and confirmation emails.
+3. **Policies and accounts:** shipping, returns, refunds, exchanges, payments, and account help.
 
----
+Requests outside the supported domain (for example, weather or general coding help) are declined and redirected. Ava has **no live order, carrier, or payment-system access**. It explains documented policies and processes but must not claim that it has found, cancelled, or refunded a real order.
 
-## 3. Model Selection & Context Memory Management (Phase II)
+### Conversation stages
 
-### Model choice: `qwen2.5:1.5b-instruct-q4_K_M`
+The conversation manager tracks these stages per session:
 
-| Criterion | Why this model |
+`greeting → intent_identification → info_gathering → resolution → confirmation → closing`
+
+| Stage | Purpose |
 |---|---|
-| Size | 1.5B parameters — comfortably inside the 0.5B-4B range and fast enough for real-time streaming on a laptop CPU. |
-| Quantization | Q4_K_M — a good quality/speed trade-off for CPU inference in Ollama's GGUF format. |
-| Instruction tuning | Ships as an instruct-tuned chat model, so it follows the structured system prompt / role format well without extra fine-tuning. |
-| License / availability | Open weights, pulled directly via `ollama pull qwen2.5:1.5b-instruct-q4_K_M`, no API key or cloud dependency. |
-| Alternatives considered | `phi3.5:3.8b-mini-instruct-q4_K_M` (stronger but noticeably slower TTFT on CPU) and `gemma2:2b-instruct-q4_K_M` (a solid middle ground) — both are drop-in alternatives; just change `OLLAMA_MODEL` in `app/config.py` or the `OLLAMA_MODEL` env var. |
+| `greeting` | Greet the user and offer supported topics |
+| `intent_identification` | Clarify a vague request, such as “I need help” |
+| `info_gathering` | Collect details needed to respond, such as the product or issue |
+| `resolution` | Give a policy-grounded answer or next step |
+| `confirmation` | Check whether the question has been answered |
+| `closing` | End the conversation when the user is finished |
 
-Swap models at any time with:
-```bash
-ollama pull phi3.5:3.8b-mini-instruct-q4_K_M
-export OLLAMA_MODEL=phi3.5:3.8b-mini-instruct-q4_K_M
+**Topic switches:** Each message is keyword-scored against the supported intents. If it matches a different intent from the active one, the manager updates `active_intent` and returns to `info_gathering` while preserving history. Retrieval is performed for each substantive message, so switching from returns to shipping can retrieve shipping documents.
+
+**Off-topic messages:** A whole-word keyword filter blocks clear off-topic requests before retrieval or generation. Less obvious cases are handled by the system prompt. When relevant excerpts are retrieved, the prompt instructs Ava to answer from those excerpts rather than asking for unnecessary details.
+
+### Example dialogues
+
+These examples illustrate intended behaviour. Replace them with transcripts captured from your own runs before submission.
+
+**Grounded product answer with citations**
+
+```text
+User: Can I use the H200 headphones with my laptop?
+Ava: Yes, if your laptop supports Bluetooth audio, you can pair them through its
+     Bluetooth settings (see [1]). The USB-C port is for charging only, not wired audio.
+     Sources: [1] WaveSound H200 Compatibility FAQ
+              [2] WaveSound H200 Wireless Headphones
 ```
 
-### Context memory management scheme
+**Policy answer followed by a topic switch**
 
-Implemented in `ConversationManager._build_messages` and
-`ConversationManager._maybe_summarize` (`app/conversation_manager.py`),
-configured in `app/config.py`. The goal is to keep prompt size roughly
-**constant** regardless of how long a session runs (important for CPU
-latency), while staying faithful to recent context:
-
-1. **System prompt (always included)** — the domain policy/persona prompt,
-   plus a dynamic line naming the current stage and active intent, so the
-   model always knows *where* in the flow it is.
-2. **Rolling summary (one message, updated in place)** — once the raw turn
-   history exceeds `SUMMARY_TRIGGER_TURNS` (default: 8 turns), the oldest
-   turns that are about to fall outside the sliding window are folded into a
-   single 2-3 sentence summary via **one extra call to the same local
-   model** (plain prompting, not a tool/agent/RAG call) and then dropped from
-   raw history. The summary is appended to (not replaced by) any prior
-   summary, so it keeps growing gist-level context, not raw text.
-3. **Sliding window (verbatim, bounded)** — only the most recent
-   `MAX_TURNS_IN_WINDOW` (default: 6) user/assistant turn-pairs are sent
-   word-for-word, so the model has precise access to what was *just* said.
-4. **Defensive token-budget trim** — as a final safety net, if the estimated
-   token count (`len(text)//4` heuristic, to avoid pulling in a tokenizer
-   dependency) still exceeds `MAX_PROMPT_TOKENS` (default: 1800), the oldest
-   non-system message is dropped repeatedly until it fits.
-
-This means: short conversations get the full raw history (simple, maximally
-faithful); long conversations get O(1) prompt growth — a system prompt + one
-summary message + a fixed-size window — so turn 50 of a conversation costs
-roughly the same inference time as turn 5.
-
-### Latency Benchmarks
-
-Measured with `benchmark/benchmark_latency.py`, which sends 5 representative
-in-domain prompts straight to Ollama (bypassing the FastAPI layer to isolate
-pure inference latency) and reports per-prompt and averaged
-time-to-first-token (TTFT) and tokens/sec.
-
-```bash
-python benchmark/benchmark_latency.py --model qwen2.5:1.5b-instruct-q4_K_M --runs 3
+```text
+User: Can I return a gift card?
+Ava: No. Gift cards are non-returnable (see [1]).
+User: Okay. How long does express shipping take?
+Ava: Express shipping normally takes 1–2 business days after dispatch (see [1]).
+     It does not guarantee a specific delivery hour.
 ```
 
-> **Run this on your own machine and paste the output here before submitting** —
-> this sandbox has no network access to run Ollama, so the numbers below are a
-> placeholder table showing the exact shape you should fill in (replace with
-> your actual benchmark output):
+**No relevant document**
 
-| Metric | Value (fill in from your run) |
-|---|---|
-| Hardware (CPU, cores, RAM) | e.g. Apple M2, 8 cores, 16GB |
-| Avg time-to-first-token | e.g. 0.XX s |
-| Avg total response time | e.g. X.XX s |
-| Avg tokens/sec | e.g. XX.X tok/s |
-| Min / Max TTFT | e.g. 0.XX s / 0.XX s |
+```text
+User: Do you sell dishwashers?
+Ava: I don't have that information in my knowledge base. Please contact BrightCart support.
 
-The live chat UI also shows **per-response** TTFT / tokens-per-second /
-total-time under every assistant message (see the `done` WebSocket event and
-`addMeta()` in `static/app.js`), so you can screenshot real numbers straight
-from normal usage for your README/report as well.
+User: What's the weather like today?
+Ava: I'm Ava, BrightCart's order support assistant. I can help with product questions,
+     order tracking, shipping, and returns. Is there anything along those lines I can help with?
+```
 
 ---
 
-## 4. Setup & Run Instructions
+## 2. Architecture and project structure
+
+### Request flow
+
+**Offline indexing**
+
+1. Read Markdown files from `data/corpus/`.
+2. Remove boilerplate and split content into sentence-bounded chunks.
+3. Prefix each chunk with its document title.
+4. Embed the chunks with Ollama's `all-minilm` model.
+5. Save vectors, chunk text, and metadata under `index/`.
+
+**Online chat**
+
+1. Receive a WebSocket message.
+2. Apply the off-topic guard and update the conversation stage.
+3. Retrieve relevant chunks unless retrieval is unnecessary (for example, small talk).
+4. Fit retrieved excerpts and conversation history within the model's context budget.
+5. Stream the answer from Ollama.
+6. Send a `done` event containing timing information and source citations when available.
+7. Run conversation summarisation after `done`, so it does not delay the answer.
+
+### Key files
+
+| File or directory | Responsibility |
+|---|---|
+| `app/main.py` | FastAPI app, WebSocket endpoint, startup, and health endpoint |
+| `app/conversation_manager.py` | Conversation stages, retrieval integration, prompt budget, and citations |
+| `app/llm_engine.py` | Ollama chat generation and streaming |
+| `app/domain.py` | Assistant instructions and domain behaviour |
+| `app/config.py` | Model settings and RAG configuration |
+| `app/schemas.py` | Request and response schemas |
+| `app/rag/chunking.py` | Markdown parsing and chunking |
+| `app/rag/embedder.py` | Async Ollama embedding client |
+| `app/rag/store.py` | Exact vector search and index persistence |
+| `app/rag/retriever.py` | Query embedding, search, threshold, cache, timeout, and circuit breaker |
+| `scripts/build_index.py` | Offline index-building pipeline |
+| `scripts/eval_retrieval.py` | Retrieval evaluation and threshold calibration |
+| `benchmark/benchmark_retrieval.py` | Retrieval-only latency benchmark |
+| `benchmark/benchmark_e2e.py` | End-to-end comparison with and without RAG |
+| `benchmark/benchmark_latency.py` | LLM latency benchmark from Assignment 1 |
+| `data/corpus/` | 50 Markdown knowledge-base documents |
+| `data/eval_queries.json` | Labelled retrieval evaluation queries |
+| `static/` | HTML, CSS, JavaScript, and citation UI |
+| `tests/` | Unit, API, and manual stress tests |
+| `index/` | Generated index files; rebuildable from the corpus |
+
+---
+
+## 3. Models and vector search
+
+### Chat model: `qwen2.5:1.5b-instruct-q4_K_M`
+
+The Assignment 1 chat model is retained and served locally through Ollama. The 1.5B-parameter quantised model is intended to keep CPU inference practical while following the assistant's instructions. Change `OLLAMA_MODEL` to use another locally available Ollama model.
+
+### Embedding model: `all-minilm`
+
+The embedding model is served by Ollama and produces 384-dimensional vectors. Using Ollama for embeddings avoids adding a separate PyTorch or `sentence-transformers` installation.
+
+Embedding requests use asynchronous `httpx` I/O and a shared HTTP client. The model is warmed up in the background at startup to reduce first-query delay.
+
+**Trade-off:** The chat and embedding models compete for CPU and memory. The embedding call also adds an HTTP request to the retrieval path.
+
+### Vector search: FAISS or NumPy
+
+The index uses exact inner-product search over L2-normalised vectors, equivalent to cosine similarity for normalised vectors:
+
+- If `faiss-cpu` is installed, the store uses FAISS `IndexFlatIP`.
+- Otherwise, it uses NumPy matrix multiplication.
+- The persisted index consists of `vectors.npy`, `chunks.json`, and `meta.json`.
+
+For this small corpus, exact search avoids the extra setup and maintenance of an approximate index or separate vector database. The NumPy path was used during development; the FAISS path is intended to return equivalent exact-search results.
+
+---
+
+## 4. Setup and run
 
 ### Prerequisites
-- Python 3.11+
-- [Ollama](https://ollama.com) installed and on your PATH
 
-### 1. Install and start Ollama, pull the model
+- Python 3.11 or newer
+- [Ollama](https://ollama.com/) installed and running
+- Project files, including `requirements.txt` and `data/corpus/`
+
+Run commands from the **project root**—the directory containing `app/`, `scripts/`, `data/`, and `requirements.txt`.
+
+### Step 1 — Create and activate a virtual environment
+
+**Windows PowerShell (VS Code terminal)**
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+If `py -3.11` is unavailable but `python` points to Python 3.11 or newer, use:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+If PowerShell blocks activation, you can use the environment's Python directly instead. For example:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+**macOS / Linux**
+
 ```bash
-# macOS / Linux: see https://ollama.com/download
-ollama serve &                 # starts the local inference server (localhost:11434)
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### Step 2 — Install dependencies
+
+With the virtual environment active, run:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+`faiss-cpu` is optional where the project and platform support it; the implementation falls back to NumPy when FAISS is unavailable.
+
+### Step 3 — Start Ollama and download the models
+
+Make sure the Ollama service is running. On Windows, launch Ollama from the Start menu if needed. On macOS, open the Ollama app. On Linux, use your installed Ollama service or run `ollama serve` in a separate terminal.
+
+Download the required models:
+
+```bash
 ollama pull qwen2.5:1.5b-instruct-q4_K_M
+ollama pull all-minilm
 ```
 
-### 2. Install Python dependencies
+Keep Ollama running while you build the index and use the app.
+
+### Step 4 — Build the retrieval index
+
 ```bash
-cd ecommerce-chatbot
-python -m venv .venv && source .venv/bin/activate   # optional but recommended
-pip install -r requirements.txt
+python scripts/build_index.py
 ```
 
-### 3. Run the backend (serves API + the static chat frontend together)
+This creates the index files under `index/`. See [Build and update the index](#5-build-and-update-the-index) for full rebuild instructions.
+
+### Step 5 — Evaluate retrieval and calibrate the threshold
+
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python scripts/eval_retrieval.py
 ```
 
-### 4. Open the chat UI
-Visit **http://localhost:8000** in a browser — the FastAPI app serves
-`static/index.html` directly, so there's nothing else to start.
+Review the output and set `MIN_SCORE` in `app/config.py` (or through the supported environment-variable configuration) based on the evaluation. The default value `0.30` is a placeholder and should not be treated as calibrated until evaluation has been run.
 
-### 5. Configuration (optional)
-All tunables are environment variables, with sensible defaults in
-`app/config.py`:
+### Step 6 — Start the web application
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `OLLAMA_HOST` | `http://localhost:11434` | Where Ollama is running |
-| `OLLAMA_MODEL` | `qwen2.5:1.5b-instruct-q4_K_M` | Which pulled model to use |
-| `MAX_TURNS_IN_WINDOW` | `6` | Sliding-window size (turn pairs) |
-| `MAX_PROMPT_TOKENS` | `1800` | Hard cap before defensive trimming |
-
-### 6. Run the automated test suite
-```bash
-pytest -v
+```powershell
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
-`tests/test_conversation_manager.py` and `tests/test_api.py` use a fake LLM
-engine (no Ollama required) so they run anywhere, including CI. They cover
-stage transitions, topic-switch handling, off-topic blocking, memory
-summarization, REST endpoints, and WebSocket error handling.
 
-### 7. Run the Phase VI manual stress test (needs a live server + Ollama)
-```bash
-# in one terminal
-uvicorn app.main:app --port 8000
-# in another terminal
-python tests/manual_stress_test.py
-```
-This deliberately sends a malformed message, an unknown `session_id`, a
-mid-stream disconnect, and 4 concurrent users, and asserts the server handles
-all of them gracefully (see §6 below for what it checks and why).
+Using `python -m uvicorn` helps ensure Uvicorn runs from the active Python environment. `--reload` is useful during development; omit it for benchmark runs.
 
-### 8. Run the latency benchmark
-```bash
-python benchmark/benchmark_latency.py
-```
+Open **http://127.0.0.1:8000** in your browser.
+
+### Quick-start checklist
+
+- [ ] Virtual environment activated
+- [ ] Dependencies installed
+- [ ] Ollama running
+- [ ] Both Ollama models downloaded
+- [ ] Index built
+- [ ] Retrieval threshold evaluated and configured
+- [ ] Server started and UI opens in the browser
+
+### Updating the knowledge base
+
+1. Add, edit, or remove Markdown files under `data/corpus/`.
+2. Run `python scripts/build_index.py`.
+3. Restart the web server if necessary.
+
+The indexer is incremental: unchanged chunks can reuse their existing vectors. Use `python scripts/build_index.py --full` to re-embed the entire corpus.
 
 ---
 
-## 5. WebSocket API Reference
+## 5. Build and update the index
 
-**Endpoint:** `ws://localhost:8000/ws/chat`
+Run the index-building script from the project root:
 
-**Client → Server** (one message type):
-```json
-{"type": "message", "session_id": "3fa2...-uuid", "text": "Where is my order?"}
+```bash
+python scripts/build_index.py          # Incremental build
+python scripts/build_index.py --full   # Re-embed all chunks
 ```
 
-**Server → Client** (a stream of events per turn):
-```json
-{"type": "stage", "stage": "info_gathering"}
-{"type": "token", "text": "Hi! "}
-{"type": "token", "text": "Happy "}
-{"type": "token", "text": "to help. "}
+### Chunking strategy
+
+Implemented in `app/rag/chunking.py`:
+
+1. The first `# ` heading is used as the document title; the parent folder identifies the category.
+2. The `## Source` section is removed because the corpus files share boilerplate there. Embedding repeated boilerplate could inflate similarity for unrelated queries and make no-match detection less reliable.
+3. Text is split at sentence boundaries and packed into chunks of at most **600 characters**, with a **one-sentence overlap**.
+4. Each chunk is prefixed with its document title so the embedding retains context about the product or policy.
+
+The current corpus is short—approximately 440 characters per document—so the 50 documents currently produce 50 chunks. The chunking logic is also tested against longer documents.
+
+### Incremental indexing
+
+Each chunk is keyed by the SHA-256 hash of its text. On an incremental run:
+
+- Unchanged chunks reuse their vectors.
+- New or edited chunks are embedded.
+- Removed documents are removed from the index.
+- A change to the embedding model triggers re-embedding.
+- Files are written atomically using a temporary file and rename.
+
+The implementation notes report that an unchanged rebuild embeds zero of 50 chunks. A test edit/add/delete scenario reported two new embeddings, 48 reused vectors, and two removed chunks.
+
+---
+
+## 6. How retrieval works
+
+### Main configuration
+
+Settings are defined in `app/config.py` and can be overridden through environment variables where supported.
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| `TOP_K` | `4` | Number of chunks retrieved per query; at least three are retrieved |
+| `MIN_SCORE` | `0.30` | Minimum similarity threshold; currently an uncalibrated placeholder |
+| `CHUNK_MAX_CHARS` | `600` | Maximum chunk length |
+| Chunk overlap | 1 sentence | Preserves context across chunk boundaries |
+| `RAG_MAX_CONTEXT_TOKENS` | `800` | Maximum token budget for retrieved text |
+| `RETRIEVAL_TIMEOUT` | `1.5` seconds | Timeout for embedding and search |
+| `RETRIEVAL_CACHE_SIZE` | `256` | Maximum number of cached retrieval results |
+
+### Per-message flow
+
+1. Check whether the message is off-topic.
+2. Update the conversation stage.
+3. Retrieve relevant chunks when appropriate.
+4. Build a prompt that fits the model's context budget.
+5. Stream the answer.
+6. Record the successful turn and send the `done` event, including source information where available.
+
+Greetings, thanks, and goodbyes skip retrieval. Short follow-ups (fewer than six words) use the latest substantive user message together with the follow-up text to preserve context.
+
+### Adding excerpts to the prompt
+
+Retrieved chunks are numbered and added to the final user message, followed by an instruction to answer from the excerpts. For example:
+
+```text
+Knowledge base excerpts:
+
+[1] WaveSound H200 Compatibility FAQ
+Q: Can I use H200 with my laptop and phone? A: Yes, if ...
+
+[2] WaveSound H200 Wireless Headphones
 ...
-{"type": "done", "time_to_first_token": 0.42, "total_time": 2.1, "tokens_per_second": 18.6, "stage": "info_gathering"}
+
+Answer directly from the excerpts above. Ask a follow-up only if you truly need more information.
+
+Customer message: Can I use the H200 headphones with my laptop?
 ```
 
-Off-topic messages skip the LLM entirely and return:
+The system prompt tells Ava to treat retrieved excerpts as the source of truth for product specifications and policies, cite the relevant source (for example, `(see [1])`), and admit when the excerpts do not contain the answer.
+
+Excerpts are not stored in conversation history, so they do not accumulate across turns. Keeping excerpts in the latest user message is also intended to preserve a stable system-prompt/history prefix for prompt caching; this is a design intention, not a measured performance claim.
+
+### Context-window budget
+
+The model context is configured for `4096` tokens, with `512` tokens reserved for the response. This leaves a nominal prompt budget of **3584 tokens**. Token use is estimated conservatively at approximately 3.5 characters per token.
+
+When space is limited, the prompt builder prioritises:
+
+1. System prompt and rolling summary
+2. Current customer message
+3. Retrieved excerpts, ranked by relevance and capped at 800 tokens
+4. Recent conversation history, dropping the oldest turns first
+
+Chunks are kept whole where possible. If the best chunk is too large, it can be cut at a sentence boundary and marked `[truncated]`. Retrieved context should not displace the current question. Summarisation runs after the `done` event so it does not delay the response.
+
+### Citation UI
+
+The WebSocket `done` event includes `sources` for the chunks actually included in the prompt. The UI displays citation chips under the answer. Clicking a chip shows the document path, relevance score, and exact excerpt shown to the model.
+
+When no relevant documents match, or the knowledge base is unavailable, the UI reports that status rather than implying that the answer is grounded in retrieved documents.
+
+---
+
+## 7. WebSocket and REST API
+
+### WebSocket endpoint
+
+`ws://localhost:8000/ws/chat`
+
+The request format and core event types remain compatible with Assignment 1. The `done` event adds two optional, backwards-compatible fields: `sources` and `retrieval`.
+
+**Request example**
+
 ```json
-{"type": "blocked", "text": "I'm Ava, Brightcart's order support assistant, ..."}
+{
+  "type": "message",
+  "session_id": "...",
+  "text": "Can I use the H200 headphones with my laptop?"
+}
 ```
 
-Any failure (malformed JSON, unknown session, model/connection error) returns
-a clean error event instead of closing the socket:
+**Illustrative `done` event**
+
 ```json
-{"type": "error", "message": "Malformed request: ..."}
+{
+  "type": "done",
+  "time_to_first_token": 0.82,
+  "total_time": 3.4,
+  "tokens_per_second": 14.2,
+  "stage": "info_gathering",
+  "sources": [
+    {
+      "n": 1,
+      "title": "WaveSound H200 Compatibility FAQ",
+      "doc_id": "product_faqs/faq_016_headphone_compatibility.md",
+      "category": "product_faqs",
+      "score": 0.62,
+      "snippet": "Q: Can I use H200 with my laptop and phone? A: Yes, ..."
+    }
+  ],
+  "retrieval": {
+    "status": "ok",
+    "ms": 18.4,
+    "cached": false
+  }
+}
 ```
 
-**REST endpoints:**
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/api/health` | Health check; also pings Ollama |
-| `POST` | `/api/session` | Create a new session, returns `session_id` + greeting |
-| `GET` | `/api/session/{id}` | Inspect a session's stage/intent/turn count |
-| `DELETE` | `/api/session/{id}` | End a session (used by "New chat") |
+The values above are an **example payload**, not a benchmark result. `retrieval.status` can be `ok`, `no_match`, `skipped`, `unavailable`, or `disabled`.
+
+`total_time` represents wall-clock generation time, while `tokens_per_second` reports decode speed.
+
+### REST endpoints
+
+- `GET /api/health` — health status, including `retrieval_ready`, `index_chunks`, and `embed_model`
+- `POST /api/session` — create a session
+- `GET /api/session/{id}` — inspect a session
+- `DELETE /api/session/{id}` — delete a session
 
 ---
 
-## 6. Production Readiness & Evaluation (Phase VI)
+## 8. Tests
 
-What was tested and how, per the assignment's three required checks:
+Run only the RAG test file:
 
-- **Latency** — `benchmark/benchmark_latency.py` measures TTFT and total
-  response time directly against Ollama; the live UI also surfaces these
-  numbers per-response for informal spot checks under normal interactive use.
-- **Correctness / staying in character** — `tests/test_conversation_manager.py`
-  asserts the stage machine behaves correctly (greeting → intent →
-  info-gathering → resolution → confirmation → closing), that topic switches
-  mid-conversation are handled without losing history, and that the
-  domain-policy text in `app/domain.py` matches what's actually sent to the
-  model. The off-topic test confirms attempts to push the bot off-topic
-  (including prompt-injection-style phrases like "ignore previous
-  instructions") are deterministically blocked before any model call.
-- **Failure handling** — `tests/manual_stress_test.py` deliberately: (1)
-  sends malformed (non-JSON) WebSocket payloads, (2) sends a message with an
-  unknown `session_id`, (3) opens a connection and disconnects mid-stream
-  without reading the response, and (4) opens several concurrent sessions at
-  once. In every case the server is expected to respond with a clean
-  `{"type": "error", ...}` event (or simply drop the broken connection
-  cleanly) rather than crash — this is enforced in `app/main.py`'s
-  `ws_chat()` handler via per-message try/except blocks and a `_safe_send()`
-  helper that swallows send failures on an already-closed socket. Concurrency
-  is achieved naturally because each WebSocket connection runs in its own
-  asyncio task and the Ollama call itself is a non-blocking streaming HTTP
-  request (`httpx.AsyncClient`), so one user's slow generation never blocks
-  another's.
+```powershell
+python -m pytest tests/test_rag.py -v
+```
+
+Run the full test suite:
+
+```powershell
+python -m pytest tests/ -v
+```
+
+If pytest is not installed in the active environment:
+
+```powershell
+python -m pip install pytest
+```
+
+The repository includes tests for chunking, retrieval behaviour, error handling, context budgeting, conversation management, and the API. Confirm the current test count from your own run rather than relying on a count in this README.
 
 ---
 
-## 7. Known Limitations
+## 9. Changes since Assignment 1
 
-- **No real order database.** As required, there's no RAG/tool layer, so Ava
-  cannot actually look up a specific order's live status — she's explicitly
-  instructed to be transparent about this and explain policy/process instead
-  of fabricating a tracking result. This is an intentional constraint of the
-  assignment, not a bug.
-- **Rule-based intent detection is keyword-based**, not a learned classifier.
-  It's fast and deterministic (good for mid-conversation topic-switch
-  detection and the off-topic fast-path) but can misfire on unusual phrasing
-  that doesn't contain any of the listed keywords; in that case the system
-  prompt's own instructions are the fallback line of defense.
-  by example, "my fridge is broken" won't hit any order/return/product
-  keyword and would quietly fall through to intent_identification rather than
-  being flagged as a special case.
-- **Sessions are in-memory only** (a plain Python dict on the server
-  process). Restarting the server loses all active sessions, and this won't
-  scale horizontally across multiple server processes/instances without
-  adding a shared session store (e.g. Redis) — out of scope for this
-  assignment but a natural next step for Assignment 2/3.
-- **Summarization quality depends on the small model.** Folding old turns
-  into a rolling summary uses the same 1.5B model, which occasionally drops
-  minor details (e.g. an exact order number) in the summary; the sliding
-  window mitigates this for anything recent, but very long sessions could
-  lose some older specifics.
-- **No authentication/authorization** — anyone who can reach the server can
-  open sessions; fine for a local class assignment, not production-ready.
-- **Token streaming granularity** follows Ollama's own chunking (roughly
-  sub-word pieces), not strictly one-token-per-chunk, though it still reads
-  as smooth word-by-word streaming in the UI.
+- **Static file serving:** Fixed the mismatch between `/static/style.css` and `/static/app.js` URLs and the static-file mount.
+- **Off-topic matching:** Replaced substring matching with whole-word matching to avoid blocking legitimate support messages because of accidental substrings.
+- **Timing metrics:** `total_time` now represents wall-clock time; decode speed is reported separately as `tokens_per_second`.
+- **Conversation reliability:** Conversation history is recorded only after successful generation, and summarisation runs after the `done` event.
+- **Context budgeting:** Token estimation is more conservative (about 3.5 characters per token), and `num_predict` caps response length.
+- **Prompt budget:** Replaced the earlier `MAX_PROMPT_TOKENS` approach with a budget derived from the configured model context length.
+- **Domain consistency:** Standardised the brand name as BrightCart and removed an unused example dialogue that referred to a product absent from the corpus.
+- **RAG integration:** Added document chunking, local embeddings, persistent vector search, retrieval caching, timeouts, a circuit breaker, prompt context management, and visible source citations.
 
 ---
 
-## 8. Project Structure
+## 10. Configuration reference
 
-```
-ecommerce-chatbot/
-├── app/
-│   ├── main.py                 # FastAPI app: REST + WebSocket endpoints
-│   ├── conversation_manager.py # Session state, stage machine, memory mgmt
-│   ├── llm_engine.py           # Async streaming Ollama client
-│   ├── domain.py                # System prompt, policies, stages, keywords
-│   ├── schemas.py                # Pydantic request/response models
-│   └── config.py                 # All tunables (env-overridable)
-├── static/
-│   ├── index.html / style.css / app.js   # Chat UI
-├── tests/
-│   ├── test_conversation_manager.py      # Unit tests (fake LLM, no Ollama needed)
-│   ├── test_api.py                        # REST + WebSocket integration tests
-│   └── manual_stress_test.py             # Phase VI live failure/concurrency script
-├── benchmark/
-│   └── benchmark_latency.py              # TTFT / tokens-per-sec benchmark
-├── requirements.txt
-├── pytest.ini
-└── README.md
-```
+Review `app/config.py` for all settings. Important configuration names include:
+
+- `OLLAMA_MODEL`
+- `EMBED_MODEL`
+- `TOP_K`
+- `MIN_SCORE`
+- `RETRIEVAL_TIMEOUT`
+- `INDEX_DIR`
+- `CORPUS_DIR`
+- `RAG_MAX_CONTEXT_TOKENS`
+
+Check `app/config.py` for exact supported environment-variable names and defaults.
